@@ -101,6 +101,13 @@ pub(crate) enum PrepareResult {
 }
 
 impl PrepareResult {
+    pub(crate) fn conflict(&self) -> Option<Ballot> {
+        match self {
+            Self::Prepared(_) => None,
+            Self::Conflict(ballot) => Some(*ballot),
+        }
+    }
+
     pub(crate) fn value(&self) -> Option<&VersionedValue> {
         match self {
             Self::Prepared(value) => Some(value),
@@ -153,6 +160,11 @@ impl std::cmp::PartialOrd for VersionedValue {
 pub(crate) enum AcceptResult {
     Conflict { ballot: Ballot },
     Accepted,
+}
+impl AcceptResult {
+    pub(crate) fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted)
+    }
 }
 
 #[derive(Debug, Clone)]

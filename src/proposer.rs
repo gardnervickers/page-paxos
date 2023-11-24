@@ -7,11 +7,6 @@ use crate::acceptor::{AcceptResult, Acceptor, PrepareResult, VersionedValue};
 use crate::{Ballot, ProposerId, Slot};
 
 pub(crate) struct Proposer<A> {
-    // TODO: We should keep a per-proposer cache of
-    //       ballots and values. This would allow us to
-    //       do something like the preferred leader optimization
-    //       where acceptors automatically run the prepare phase
-    //       on behalf of the last proposer.
     id: ProposerId,
     acceptors: Vec<A>,
 }
@@ -39,6 +34,7 @@ where
         //    along with the highest known value for the slot.
         let (last_val, new_ballot) = self.prepare(slot).await?;
         assert_eq!(new_ballot.0, self.id);
+        self.cache_ballot(slot, new_ballot);
         log::info!(
             "{:?} prepare success slot={slot:?} last_ballot={:?}, new_ballot={new_ballot:?}",
             self.id,
@@ -58,37 +54,22 @@ where
         //    work that we performed above. If we are successful, we will return an
         //    error.
         let new_value = VersionedValue::new(new_ballot, new_value);
-        let _new_value = self.accept(slot, new_value).await?;
+        self.accept(slot, new_value).await?;
         Ok(last_val)
     }
 
-    async fn accept(&mut self, slot: Slot, value: VersionedValue) -> Result<VersionedValue, Error> {
-        let futs = FuturesUnordered::new();
-
-        // Send accept messages to all acceptors.
-        for acceptor in &self.acceptors {
-            let fut = acceptor.accept(slot, value.clone());
-            futs.push(fut);
-        }
-        // Wait for a majority of responses.
-        let promises = wait_for(futs, self.majority()).await;
-        let nr_success = promises
-            .iter()
-            .filter(|res| matches!(res, Ok(AcceptResult::Accepted { .. })))
-            .count();
-        if nr_success >= self.majority() {
-            Ok(value)
-        } else {
-            Err(Error::Conflict)
-        }
-    }
-
-    /// Run through the prepare phase.
+    /// Execute the prepare phase for all acceptors.
     ///
-    /// Returns the highest known value for the slot.
-    async fn prepare(&mut self, slot: Slot) -> Result<(VersionedValue, Ballot), Error> {
+    /// This will prepare a new ballot for the given slot by sending a prepare message
+    /// to all acceptors.
+    ///
+    /// On success, returns a tuple of the highest known value for the slot and the
+    /// new ballot number. The new ballot number will be higher than any previously seen
+    /// ballot numbers and will be owned by this proposer.
+    async fn prepare(&self, slot: Slot) -> Result<(VersionedValue, Ballot), Error> {
         let mut last_known_ballot = self.new_ballot_for_slot(slot);
         loop {
+            // TODO: Add backoff/retry and some limit on the number of retries.
             let propose_ballot = last_known_ballot.increment(self.id);
 
             // Send prepare messages to all acceptors.
@@ -99,7 +80,7 @@ where
             }
 
             // Wait for a majority of responses.
-            let promises = wait_for(futs, self.majority()).await;
+            let promises = wait_for(futs, self.majority(), |v| v.value().is_some()).await;
             let nr_success = promises
                 .iter()
                 .filter(|res| matches!(res, Ok(PrepareResult::Prepared { .. })))
@@ -115,18 +96,53 @@ where
                     .unwrap();
                 return Ok((value, propose_ballot));
             }
-            // Majority was not reached. Blindly increment the ballot and try again.
-            //
-            // This is inefficient but correct, really we should look at the responses
-            // and pick a ballot number from them.
-            last_known_ballot = propose_ballot;
+
+            // Majority was not reached. Set the last known ballot to the highest
+            // ballot number returned by the acceptors and retry.
+            let max_ballot = promises
+                .into_iter()
+                .filter_map(|res| res.ok())
+                .filter_map(|res| res.conflict())
+                .max()
+                .unwrap_or(propose_ballot);
+            last_known_ballot = max_ballot;
             continue;
+        }
+    }
+
+    /// Execute the accept phase for all acceptors.
+    ///
+    /// This will send an accept message to all acceptors. If a majority of acceptors
+    /// respond positively, Ok will be returned. If we fail
+    /// to reach a majority, an error will be returne instead.
+    async fn accept(&self, slot: Slot, value: VersionedValue) -> Result<(), Error> {
+        let futs = FuturesUnordered::new();
+
+        // Send accept messages to all acceptors.
+        for acceptor in &self.acceptors {
+            let fut = acceptor.accept(slot, value.clone());
+            futs.push(fut);
+        }
+        // Wait for a majority of responses.
+        let promises = wait_for(futs, self.majority(), |v| v.is_accepted()).await;
+        let nr_success = promises
+            .iter()
+            .filter(|res| matches!(res, Ok(AcceptResult::Accepted { .. })))
+            .count();
+        if nr_success >= self.majority() {
+            Ok(())
+        } else {
+            Err(Error::Conflict)
         }
     }
 
     fn new_ballot_for_slot(&self, _slot: Slot) -> Ballot {
         // TODO: Use this for a cache lookup at some point.
         Ballot::new(self.id, 0)
+    }
+
+    fn cache_ballot(&mut self, _slot: Slot, _new_ballot: Ballot) {
+        // TODO: Use this to store ballots in the cache.
     }
 
     fn majority(&self) -> usize {
@@ -140,15 +156,26 @@ pub(crate) enum Error {
     Conflict,
 }
 
-async fn wait_for<U>(
-    mut futures: FuturesUnordered<impl Future<Output = U>>,
+/// Wait for a majority of successful responses.
+///
+/// This will wait for a majority of successful responses to come back.
+/// The full list of all responses will be returned.
+async fn wait_for<U, E>(
+    mut futures: FuturesUnordered<impl Future<Output = Result<U, E>>>,
     majority: usize,
-) -> Vec<U> {
+    is_success: impl Fn(&U) -> bool,
+) -> Vec<Result<U, E>> {
     let mut results = Vec::new();
+    let mut num_success = 0;
     while let Some(result) = futures.next().await {
+        if let Ok(res) = &result {
+            if is_success(res) {
+                num_success += 1;
+            }
+        }
         results.push(result);
-        if results.len() == majority {
-            return results;
+        if num_success >= majority {
+            break;
         }
     }
     results
