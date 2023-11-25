@@ -7,6 +7,7 @@ use crate::sim::rng;
 use crate::sim::SimError;
 
 use rand::seq::SliceRandom;
+use tracing::Instrument;
 
 type SimResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -60,7 +61,7 @@ impl Trial {
         F: Future<Output = SimResult> + 'static,
     {
         let machine = Machine {
-            future: Box::pin(future),
+            future: Box::pin(future.instrument(tracing::info_span!("machine", machine = name))),
             localset: tokio::task::LocalSet::new(),
         };
         if self.machines.contains_key(&name) {
@@ -83,20 +84,17 @@ impl Trial {
             let machine = self.machines.get_mut(&name).unwrap();
             match Pin::new(machine).poll(cx) {
                 Poll::Ready(Ok(())) => {
-                    log::debug!("machine.exit");
+                    tracing::debug!("machine.exit");
                     self.machines.remove(&name);
                 }
                 Poll::Ready(Err(err)) => {
                     self.machines.remove(&name);
                     return Poll::Ready(Err(SimError::from_machine(name, self.seed, err)));
                 }
-                Poll::Pending => {
-                    log::debug!("machine.pending")
-                }
+                Poll::Pending => {}
             }
         }
         if self.machines.is_empty() {
-            log::debug!("machines.empty");
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending

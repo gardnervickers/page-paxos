@@ -41,10 +41,10 @@ fn get_delay(max: Duration) -> Duration {
     State::current(|s| s.rng().gen_range(Duration::from_millis(0)..max))
 }
 
-pub(crate) fn shuffle<T>(slice: &mut [T]) {
+pub(crate) fn shuffle<T>(_slice: &mut [T]) {
     #[cfg(test)]
     {
-        State::current(|s| slice.shuffle(&mut s.rng()));
+        State::current(|s| _slice.shuffle(&mut s.rng()));
     }
 }
 

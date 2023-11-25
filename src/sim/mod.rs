@@ -8,12 +8,14 @@ mod state;
 mod trial;
 
 use std::future::Future;
+use std::panic;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 pub use error::SimError;
 use rand::Rng;
+use tracing::Instrument;
 
 pub struct Sim {
     runtime: tokio::runtime::Runtime,
@@ -57,11 +59,28 @@ impl Sim {
     #[allow(clippy::await_holding_lock)]
     pub fn block_on<F, U>(self, future: F) -> Result<U, SimError>
     where
-        F: std::future::Future<Output = Result<U, Box<dyn std::error::Error>>>,
+        F: Future<Output = Result<U, Box<dyn std::error::Error>>>,
     {
-        let state = self.state;
+        let seed = self.state.seed();
         let runtime = self.runtime;
-        state.enter(|| runtime.block_on(async move { SimFuture::new(future).await }))
+        let state = self.state;
+        // Catch panic and convert to error.
+        let panic = state.enter(|| {
+            panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                runtime.block_on(async move {
+                    SimFuture::new(future)
+                        .instrument(tracing::info_span!("sim"))
+                        .await
+                })
+            }))
+        });
+        match panic {
+            Ok(result) => result,
+            Err(panic) => {
+                eprintln!("panic during simulation seed={}", seed);
+                panic::resume_unwind(panic);
+            }
+        }
     }
 
     pub fn handle(&self) -> Handle {
@@ -138,11 +157,18 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
+    use tracing_subscriber::util::SubscriberInitExt;
+
     use super::*;
 
     /// Test that time advances faster than wallclock time.
     #[test]
     fn time_advances() -> Result<(), Box<dyn std::error::Error>> {
+        let _g = tracing_subscriber::fmt()
+            .with_test_writer()
+            .without_time()
+            .finish()
+            .set_default();
         let mut sim = Sim::new_with_seed(0);
         let handle = sim.handle();
         let real_now = std::time::Instant::now();
@@ -152,6 +178,7 @@ mod tests {
         let co = Rc::clone(&completion_order);
         sim.add_machine("foo", async move {
             tokio::time::sleep(Duration::from_millis(10000)).await;
+            tracing::info!("hello from foo");
             co.borrow_mut().push("foo");
             Ok(())
         });
@@ -159,6 +186,7 @@ mod tests {
         let co = Rc::clone(&completion_order);
         sim.add_machine("bar", async move {
             tokio::time::sleep(Duration::from_millis(1000)).await;
+            tracing::info!("hello from bar");
             co.borrow_mut().push("bar");
             Ok(())
         });

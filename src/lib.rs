@@ -12,13 +12,23 @@ mod tests;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Ballot(ProposerId, u32);
 
+impl std::fmt::Display for Ballot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_unknown() {
+            write!(f, "UNKNOWN")
+        } else {
+            write!(f, "{}.{}", self.0 .0, self.1)
+        }
+    }
+}
+
 impl std::fmt::Debug for Ballot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_unknown() {
             f.debug_tuple("Ballot").field(&"UNKNOWN").finish()
         } else {
             f.debug_tuple("Ballot")
-                .field(&self.0)
+                .field(&self.0 .0)
                 .field(&self.1)
                 .finish()
         }
@@ -79,6 +89,48 @@ impl ProposerId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Slot(u64);
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct Versioned<T> {
+    ballot: Ballot,
+    value: Option<T>,
+}
+
+impl<T> std::fmt::Debug for Versioned<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Versioned")
+            .field("ballot", &self.ballot)
+            .finish()
+    }
+}
+
+impl<T> Versioned<T> {
+    pub(crate) fn new(ballot: Ballot, value: Option<T>) -> Self {
+        Self { ballot, value }
+    }
+    pub(crate) fn value(&self) -> Option<&T> {
+        self.value.as_ref()
+    }
+
+    pub(crate) fn into_value(self) -> Option<T> {
+        self.value
+    }
+
+    pub(crate) fn ballot(&self) -> Ballot {
+        self.ballot
+    }
+}
+
+impl<T: Eq> std::cmp::Ord for Versioned<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.ballot.cmp(&other.ballot)
+    }
+}
+impl<T: Eq> std::cmp::PartialOrd for Versioned<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[cfg(test)]
 mod test {

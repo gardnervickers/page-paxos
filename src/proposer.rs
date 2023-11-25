@@ -1,16 +1,26 @@
+use std::collections::HashMap;
 use std::future::Future;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
-use crate::acceptor::{AcceptResult, Acceptor, PrepareResult, VersionedValue};
+use crate::acceptor::{AcceptResult, Acceptor, PrepareResult};
 use crate::sim::buggify;
-use crate::{Ballot, ProposerId, Slot};
+use crate::{Ballot, ProposerId, Slot, Versioned};
+
+static LOG: &str = "proposer";
 
 #[derive(Debug)]
 pub(crate) struct Proposer<A> {
     id: ProposerId,
+    // TODO: Really we could split this into a prepare and accept set, each
+    // with their own quorum sizes.
+    //
+    // We would just make sure that the prepare set overlaps with the accept
+    // set. For example we could have a 5 node cluster with 4 prepare nodes
+    // and 2 accept nodes.
     acceptors: Vec<A>,
+    ballot_cache: HashMap<Slot, Ballot>,
 }
 
 impl<A> Proposer<A>
@@ -18,7 +28,11 @@ where
     A: Acceptor,
 {
     pub(crate) fn new(id: ProposerId, acceptors: Vec<A>) -> Self {
-        Self { id, acceptors }
+        Self {
+            id,
+            acceptors,
+            ballot_cache: Default::default(),
+        }
     }
 
     pub(crate) fn id(&self) -> ProposerId {
@@ -30,7 +44,11 @@ where
     /// a transform function. The transform function will be applied to the
     /// value and the result will be sent to the acceptors. This method
     /// will return the last committed value of the slot.
-    pub(crate) async fn cas<F>(&mut self, slot: Slot, mut xform: F) -> Result<VersionedValue, Error>
+    pub(crate) async fn cas<F>(
+        &mut self,
+        slot: Slot,
+        mut xform: F,
+    ) -> Result<Versioned<Vec<u8>>, Error>
     where
         F: FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
     {
@@ -42,38 +60,33 @@ where
         //    along with the highest known value for the slot.
         let (last_val, new_ballot) = self.prepare(slot).await?;
         assert_eq!(new_ballot.0, self.id);
-        self.cache_ballot(slot, new_ballot);
-        log::info!(
-            "{:?} prepare success slot={slot:?} last_ballot={:?}, new_ballot={new_ballot:?}",
-            self.id,
-            last_val.ballot(),
-        );
 
         // Transform the value using the CAS function.
-        //
-        // TODO: We could actually store a queue of CAS functions and apply them
-        //       in any order. This would allow us to "batch" CAS operations in
-        //       the same way that we can batch log appends in a log oriented consensus
-        //       protocol.
-        let new_value = (xform)(last_val.value());
-        log::info!(
-            "{:?} last_value={:?} => new_value={:?}",
-            self.id,
-            last_val,
-            new_value
-        );
+        let new_value = (xform)(last_val.value().map(|v| v.as_slice()));
 
         // Shuffle the acceptors between stages to increase the likelihood of
         // accepts landing on a different set of acceptors than were used for the
         // prepare phase.
         buggify::shuffle(&mut self.acceptors);
 
+        tracing::debug!(target: LOG,
+            new = ?new_ballot,
+            old = ?last_val.ballot(),
+            "cas.accept.start"
+        );
+
         // 2. Accept Phase:
         //    Send the new value to the acceptors. The goal here is to confirm the
         //    work that we performed above. If we are successful, we will return an
         //    error.
-        let new_value = VersionedValue::new(new_ballot, new_value);
+        let new_value = Versioned::new(new_ballot, new_value);
         self.accept(slot, new_value).await?;
+
+        tracing::debug!(target: LOG,
+            new = ?new_ballot,
+            old = ?last_val.ballot(),
+            "cas.accept.success"
+        );
         Ok(last_val)
     }
 
@@ -85,13 +98,14 @@ where
     /// On success, returns a tuple of the highest known value for the slot and the
     /// new ballot number. The new ballot number will be higher than any previously seen
     /// ballot numbers and will be owned by this proposer.
-    async fn prepare(&self, slot: Slot) -> Result<(VersionedValue, Ballot), Error> {
-        let mut last_known_ballot = self.new_ballot_for_slot(slot);
+    #[tracing::instrument(skip(self,), ret)]
+    async fn prepare(&mut self, slot: Slot) -> Result<(Versioned<Vec<u8>>, Ballot), Error> {
         loop {
             // TODO: Add backoff/retry and some limit on the number of retries.
-            let propose_ballot = last_known_ballot.increment(self.id);
+            let propose_ballot = self.new_ballot_for_slot(slot);
 
             // Send prepare messages to all acceptors.
+            tracing::debug!(target: LOG, ?propose_ballot, "prepare.request");
             let futs = FuturesUnordered::new();
             for acceptor in &self.acceptors {
                 let fut = acceptor.prepare(slot, propose_ballot);
@@ -104,6 +118,7 @@ where
                 .iter()
                 .filter(|res| matches!(res, Ok(PrepareResult::Prepared { .. })))
                 .count();
+            tracing::debug!(target: LOG, ?propose_ballot, ?nr_success, nr_sends = promises.len(), "prepare.request.complete");
 
             if nr_success >= self.majority() {
                 // Majority was reached, return the highest known value.
@@ -113,6 +128,8 @@ where
                     .filter_map(|res| res.into_value())
                     .max()
                     .unwrap();
+                tracing::debug!(target: LOG, ?propose_ballot, ?value, "prepare.success");
+                self.cache_ballot(slot, propose_ballot);
                 return Ok((value, propose_ballot));
             }
 
@@ -124,7 +141,8 @@ where
                 .filter_map(|res| res.conflict())
                 .max()
                 .unwrap_or(propose_ballot);
-            last_known_ballot = max_ballot;
+            tracing::debug!(target: LOG, ?propose_ballot, ?max_ballot, "prepare.conflict");
+            self.cache_ballot(slot, max_ballot);
             continue;
         }
     }
@@ -134,9 +152,11 @@ where
     /// This will send an accept message to all acceptors. If a majority of acceptors
     /// respond positively, Ok will be returned. If we fail
     /// to reach a majority, an error will be returne instead.
-    async fn accept(&self, slot: Slot, value: VersionedValue) -> Result<(), Error> {
+    #[tracing::instrument(skip(self))]
+    async fn accept(&self, slot: Slot, value: Versioned<Vec<u8>>) -> Result<(), Error> {
         let futs = FuturesUnordered::new();
 
+        tracing::debug!(target: LOG, ?value, "accept.request");
         // Send accept messages to all acceptors.
         for acceptor in &self.acceptors {
             let fut = acceptor.accept(slot, value.clone());
@@ -148,6 +168,8 @@ where
             .iter()
             .filter(|res| matches!(res, Ok(AcceptResult::Accepted { .. })))
             .count();
+
+        tracing::debug!(target: LOG, ?value, ?nr_success, nr_sends = promises.len(), "accept.request.complete");
         if nr_success >= self.majority() {
             Ok(())
         } else {
@@ -155,13 +177,21 @@ where
         }
     }
 
-    fn new_ballot_for_slot(&self, _slot: Slot) -> Ballot {
-        // TODO: Use this for a cache lookup at some point.
-        Ballot::new(self.id, 0)
+    fn new_ballot_for_slot(&self, slot: Slot) -> Ballot {
+        if let Some(existing) = self.ballot_cache.get(&slot) {
+            existing.increment(self.id)
+        } else {
+            Ballot::new(self.id, 0)
+        }
     }
 
-    fn cache_ballot(&mut self, _slot: Slot, _new_ballot: Ballot) {
-        // TODO: Use this to store ballots in the cache.
+    fn cache_ballot(&mut self, slot: Slot, new_ballot: Ballot) {
+        if let Some(existing) = self.ballot_cache.get(&slot) {
+            if existing >= &new_ballot {
+                return;
+            }
+        }
+        self.ballot_cache.insert(slot, new_ballot);
     }
 
     fn majority(&self) -> usize {

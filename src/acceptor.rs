@@ -2,7 +2,9 @@ use std::io;
 use std::rc::Rc;
 
 use crate::sim::buggify;
-use crate::{Ballot, Slot};
+use crate::{Ballot, Slot, Versioned};
+
+type VersionedVec = Versioned<Vec<u8>>;
 
 pub(crate) trait Acceptor {
     type Error: std::error::Error + Send + Sync + 'static;
@@ -11,7 +13,7 @@ pub(crate) trait Acceptor {
 
     async fn prepare(&self, slot: Slot, ballot: Ballot) -> Result<PrepareResult, Self::Error>;
 
-    async fn accept(&self, slot: Slot, value: VersionedValue) -> Result<AcceptResult, Self::Error>;
+    async fn accept(&self, slot: Slot, value: VersionedVec) -> Result<AcceptResult, Self::Error>;
 }
 
 impl<T> Acceptor for Rc<T>
@@ -28,7 +30,7 @@ where
         (**self).prepare(slot, ballot).await
     }
 
-    async fn accept(&self, slot: Slot, value: VersionedValue) -> Result<AcceptResult, Self::Error> {
+    async fn accept(&self, slot: Slot, value: VersionedVec) -> Result<AcceptResult, Self::Error> {
         (**self).accept(slot, value).await
     }
 }
@@ -69,17 +71,14 @@ where
                 if buggify::acceptor_flake() {
                     return Err(Error::Flake);
                 }
-                let value = VersionedValue {
-                    ballot: register.ballot,
-                    value: register.value.clone(),
-                };
+                let value = Versioned::new(register.ballot, register.value.clone());
                 Ok(PrepareResult::Prepared(value))
             })
             .await
-            .expect("handle IO error")
+            .expect("TODO: Handle IO error")
     }
 
-    async fn accept(&self, slot: Slot, value: VersionedValue) -> Result<AcceptResult, Error> {
+    async fn accept(&self, slot: Slot, value: VersionedVec) -> Result<AcceptResult, Error> {
         self.registers
             .update(slot, |register| {
                 if value.ballot() < register.promise {
@@ -110,7 +109,7 @@ where
 
 #[derive(Debug, Clone)]
 pub(crate) enum PrepareResult {
-    Prepared(VersionedValue),
+    Prepared(VersionedVec),
     Conflict(Ballot),
 }
 
@@ -122,51 +121,17 @@ impl PrepareResult {
         }
     }
 
-    pub(crate) fn value(&self) -> Option<&VersionedValue> {
+    pub(crate) fn value(&self) -> Option<&VersionedVec> {
         match self {
             Self::Prepared(value) => Some(value),
             Self::Conflict(_) => None,
         }
     }
-    pub(crate) fn into_value(self) -> Option<VersionedValue> {
+    pub(crate) fn into_value(self) -> Option<VersionedVec> {
         match self {
             Self::Prepared(value) => Some(value),
             Self::Conflict(_) => None,
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VersionedValue {
-    ballot: Ballot,
-    value: Option<Vec<u8>>,
-}
-
-impl VersionedValue {
-    pub(crate) fn new(ballot: Ballot, value: Option<Vec<u8>>) -> Self {
-        Self { ballot, value }
-    }
-    pub(crate) fn value(&self) -> Option<&[u8]> {
-        self.value.as_deref()
-    }
-
-    pub(crate) fn into_value(self) -> Option<Vec<u8>> {
-        self.value
-    }
-
-    pub(crate) fn ballot(&self) -> Ballot {
-        self.ballot
-    }
-}
-
-impl std::cmp::Ord for VersionedValue {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.ballot.cmp(&other.ballot)
-    }
-}
-impl std::cmp::PartialOrd for VersionedValue {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -220,6 +185,8 @@ mod tests {
 
     use tokio::sync::Mutex;
     use tokio::time;
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
 
     use crate::proposer::Proposer;
     use crate::sim::{self, buggify};
@@ -258,11 +225,14 @@ mod tests {
         }
     }
 
-    fn init() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Info)
-            .is_test(true)
-            .try_init();
+    fn init() -> impl Drop {
+        tracing_subscriber::fmt()
+            .with_test_writer()
+            .compact()
+            .with_max_level(LevelFilter::TRACE)
+            .without_time()
+            .finish()
+            .set_default()
     }
 
     #[derive(Clone)]
@@ -288,18 +258,16 @@ mod tests {
     where
         A: Acceptor + std::fmt::Debug,
     {
-        let pid = proposer.id();
         loop {
             if let Ok(res) = proposer.cas(Slot(0), do_inc).await {
                 stats.record_success();
                 return res
                     .value()
-                    .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+                    .map(|v| u64::from_be_bytes(v[..].try_into().unwrap()))
                     .unwrap_or(0);
             }
             stats.record_conflict();
             time::sleep(Duration::from_millis(100)).await;
-            log::info!("{:?} conflict detected, retrying", pid);
         }
     }
 
@@ -311,7 +279,7 @@ mod tests {
             if let Ok(res) = proposer.cas(Slot(0), |v| v.map(|s| s.to_owned())).await {
                 return res
                     .value()
-                    .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+                    .map(|v| u64::from_be_bytes(v[..].try_into().unwrap()))
                     .unwrap_or(0);
             }
         }
@@ -360,6 +328,7 @@ mod tests {
 
     #[test]
     fn multi_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
+        let _g = init();
         for _ in 0..1000 {
             let test_stats = Rc::new(TestStats::new());
             let mut sim = crate::sim::Sim::new();
@@ -368,9 +337,9 @@ mod tests {
             let stats = test_stats.clone();
             sim.add_machine("proposer-1", async move {
                 for _ in 0..5 {
-                    log::info!("proposer-1: starting inc");
+                    tracing::info!("inc.start");
                     let old = inc_and_get(&mut proposer, &stats).await;
-                    log::info!("proposer-1: inc success, old value: {}", old);
+                    tracing::info!(old, "inc.complete");
                 }
                 Ok(())
             });
@@ -379,9 +348,9 @@ mod tests {
             let stats = test_stats.clone();
             sim.add_machine("proposer-2", async move {
                 for _ in 0..5 {
-                    log::info!("proposer-2: starting inc");
+                    tracing::info!("inc.start");
                     let old = inc_and_get(&mut proposer, &stats).await;
-                    log::info!("proposer-2: inc success, old value: {}", old);
+                    tracing::info!(old, "inc.complete");
                 }
                 Ok(())
             });
@@ -396,6 +365,7 @@ mod tests {
                 let expected = 5 + 5 + test_stats.num_conflicts();
                 assert_eq!(5 + 5, test_stats.num_success());
                 assert!(current_val <= expected as u64);
+                assert!(current_val >= test_stats.num_success() as u64);
                 Ok(())
             })?;
         }
@@ -434,7 +404,7 @@ mod tests {
             // Second prepare at a higher ballot should succeed
             let result = acceptor.prepare(slot, Ballot::new(p1, 1)).await?;
             assert!(
-                matches!(result, PrepareResult::Prepared(VersionedValue{ballot,..}) if ballot.is_unknown())
+                matches!(result, PrepareResult::Prepared(VersionedVec{ballot,..}) if ballot.is_unknown())
             );
 
             // Third prepare at a lower ballot should fail
