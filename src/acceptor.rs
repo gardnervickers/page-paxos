@@ -1,6 +1,7 @@
 use std::io;
 use std::rc::Rc;
 
+use crate::sim::buggify;
 use crate::{Ballot, Slot};
 
 pub(crate) trait Acceptor {
@@ -54,10 +55,9 @@ where
     }
 
     async fn prepare(&self, slot: Slot, ballot: Ballot) -> Result<PrepareResult, Error> {
-        // 1. Return a conflict if it already saw a greater ballot number.
-
         self.registers
             .update(slot, |register| {
+                // 1. Return a conflict if it already saw a greater ballot number.
                 if ballot <= register.promise {
                     return Ok(PrepareResult::Conflict(register.promise));
                 }
@@ -66,7 +66,9 @@ where
                 }
                 // 2. Set the promise to the ballot number.
                 register.promise = ballot;
-
+                if buggify::acceptor_flake() {
+                    return Err(Error::Flake);
+                }
                 let value = VersionedValue {
                     ballot: register.ballot,
                     value: register.value.clone(),
@@ -90,9 +92,15 @@ where
                         ballot: register.ballot,
                     });
                 }
+                if buggify::acceptor_flake() {
+                    return Err(Error::Flake);
+                }
                 register.promise = value.ballot();
                 register.ballot = value.ballot();
                 register.value = value.into_value();
+                if buggify::acceptor_flake() {
+                    return Err(Error::Flake);
+                }
                 Ok(AcceptResult::Accepted)
             })
             .await
@@ -190,8 +198,13 @@ impl Default for Register {
     }
 }
 
-#[derive(Debug, Clone, Copy, thiserror::Error)]
-enum Error {}
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error("IO error")]
+    Io(#[from] io::Error),
+    #[error("Flake")]
+    Flake,
+}
 
 trait Registers {
     fn num_slots(&self) -> usize;
