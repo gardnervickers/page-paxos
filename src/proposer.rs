@@ -4,6 +4,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 
 use crate::acceptor::{AcceptResult, Acceptor, PrepareResult, VersionedValue};
+use crate::sim::buggify;
 use crate::{Ballot, ProposerId, Slot};
 
 #[derive(Debug)]
@@ -33,6 +34,8 @@ where
     where
         F: FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
     {
+        buggify::shuffle(&mut self.acceptors);
+
         // 1. Prepare Phase:
         //    The goal here is to land on a ballot number that is higher than any
         //    previously seen ballot number for this slot. Once found, it will be returned
@@ -59,6 +62,11 @@ where
             last_val,
             new_value
         );
+
+        // Shuffle the acceptors between stages to increase the likelihood of
+        // accepts landing on a different set of acceptors than were used for the
+        // prepare phase.
+        buggify::shuffle(&mut self.acceptors);
 
         // 2. Accept Phase:
         //    Send the new value to the acceptors. The goal here is to confirm the

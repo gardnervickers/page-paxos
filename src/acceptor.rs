@@ -347,12 +347,10 @@ mod tests {
 
     #[test]
     fn multi_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
-        for seed in 0..1000 {
+        for _ in 0..1000 {
             let test_stats = Rc::new(TestStats::new());
-            println!("seed: {}", seed);
-            let mut sim = crate::sim::Sim::new_with_seed(seed);
-            let acceptors = TestAcceptors::new(3, 1);
-
+            let mut sim = crate::sim::Sim::new();
+            let acceptors = TestAcceptors::new(5, 1);
             let mut proposer = acceptors.proposer(ProposerId(1));
             let stats = test_stats.clone();
             sim.add_machine("proposer-1", async move {
@@ -383,7 +381,7 @@ mod tests {
                 // The value may be incremented more than 5 times if there are
                 // conflicts, so expected is really an upper bound.
                 let expected = 5 + 5 + test_stats.num_conflicts();
-
+                assert_eq!(5 + 5, test_stats.num_success());
                 assert!(current_val <= expected as u64);
                 Ok(())
             })?;

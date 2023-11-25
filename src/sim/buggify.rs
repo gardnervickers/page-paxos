@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::time::Duration;
 
+use rand::seq::SliceRandom;
 use rand::Rng;
 use tokio::time;
 
@@ -22,4 +23,8 @@ pub(crate) async fn network_latency<F: Future>(fut: F) -> F::Output {
 
 fn get_delay(max: Duration) -> Duration {
     State::current(|s| s.rng().gen_range(Duration::from_millis(0)..max))
+}
+
+pub(crate) fn shuffle<T>(slice: &mut [T]) {
+    State::current(|s| slice.shuffle(&mut s.rng()))
 }
