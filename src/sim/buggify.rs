@@ -6,10 +6,17 @@ use tokio::time;
 
 use crate::sim::state::State;
 
-pub(crate) async fn network_latency<F: Future>(fut: F) -> F::Output {
-    time::sleep(get_delay(Duration::from_millis(1000))).await;
+pub(crate) async fn disk_latency<F: Future>(fut: F) -> F::Output {
+    time::sleep(get_delay(Duration::from_millis(30))).await;
     let res = fut.await;
-    time::sleep(get_delay(Duration::from_millis(1000))).await;
+    time::sleep(get_delay(Duration::from_millis(30))).await;
+    res
+}
+
+pub(crate) async fn network_latency<F: Future>(fut: F) -> F::Output {
+    time::sleep(get_delay(Duration::from_millis(500))).await;
+    let res = fut.await;
+    time::sleep(get_delay(Duration::from_millis(500))).await;
     res
 }
 

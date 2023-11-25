@@ -10,6 +10,7 @@ mod trial;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 pub use error::SimError;
 use rand::Rng;
@@ -27,9 +28,14 @@ impl Sim {
     pub fn new_with_seed(seed: u64) -> Self {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_time()
+            .start_paused(true)
             .build()
             .unwrap();
 
+        runtime.block_on(async {
+            // Round now to the nearest millisecond.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        });
         Self {
             runtime,
             state: state::State::new(seed),
@@ -55,12 +61,7 @@ impl Sim {
     {
         let state = self.state;
         let runtime = self.runtime;
-        state.enter(|| {
-            runtime.block_on(async move {
-                tokio::time::pause();
-                SimFuture::new(future).await
-            })
-        })
+        state.enter(|| runtime.block_on(async move { SimFuture::new(future).await }))
     }
 
     pub fn handle(&self) -> Handle {
@@ -86,6 +87,10 @@ impl Handle {
         state::State::current(|s| s.notify_all_machines_complete().clone())
             .notified()
             .await;
+    }
+
+    pub fn current() -> Self {
+        Self {}
     }
 }
 

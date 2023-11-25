@@ -6,6 +6,7 @@ use futures::StreamExt;
 use crate::acceptor::{AcceptResult, Acceptor, PrepareResult, VersionedValue};
 use crate::{Ballot, ProposerId, Slot};
 
+#[derive(Debug)]
 pub(crate) struct Proposer<A> {
     id: ProposerId,
     acceptors: Vec<A>,
@@ -17,6 +18,10 @@ where
 {
     pub(crate) fn new(id: ProposerId, acceptors: Vec<A>) -> Self {
         Self { id, acceptors }
+    }
+
+    pub(crate) fn id(&self) -> ProposerId {
+        self.id
     }
     /// Perform a consensus operation on the set of acceptors.
     ///
@@ -48,6 +53,12 @@ where
         //       the same way that we can batch log appends in a log oriented consensus
         //       protocol.
         let new_value = (xform)(last_val.value());
+        log::info!(
+            "{:?} last_value={:?} => new_value={:?}",
+            self.id,
+            last_val,
+            new_value
+        );
 
         // 2. Accept Phase:
         //    Send the new value to the acceptors. The goal here is to confirm the

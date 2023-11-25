@@ -75,6 +75,8 @@ impl Trial {
     /// Returns `Poll::Ready` if all machines have exited, `Poll::Pending` otherwise.
     pub(crate) fn poll_all(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), SimError>> {
         let mut keys = self.machines.keys().cloned().collect::<Vec<_>>();
+        // Sort first to ensure deterministic ordering.
+        keys.sort();
         // Randomize the poll order for machines.
         keys.shuffle(&mut self.rng);
         for name in keys {

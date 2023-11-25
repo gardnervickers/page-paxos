@@ -6,6 +6,9 @@ mod acceptor;
 mod proposer;
 mod sim;
 
+#[cfg(test)]
+mod tests;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Ballot(ProposerId, u32);
 
@@ -28,7 +31,7 @@ impl Ballot {
     }
 
     fn increment(&self, id: ProposerId) -> Self {
-        Self(self.0, self.1 + 1)
+        Self(id, self.1 + 1)
     }
 
     fn is_unknown(&self) -> bool {
@@ -78,7 +81,7 @@ impl ProposerId {
 struct Slot(u64);
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     #[test]

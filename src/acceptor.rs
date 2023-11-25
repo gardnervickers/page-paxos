@@ -1,3 +1,4 @@
+use std::io;
 use std::rc::Rc;
 
 use crate::{Ballot, Slot};
@@ -31,6 +32,7 @@ where
     }
 }
 
+#[derive(Debug)]
 struct AcceptorImpl<R> {
     registers: R,
 }
@@ -53,44 +55,48 @@ where
 
     async fn prepare(&self, slot: Slot, ballot: Ballot) -> Result<PrepareResult, Error> {
         // 1. Return a conflict if it already saw a greater ballot number.
-        let mut register = self.registers.read(slot).await;
-        if ballot <= register.promise {
-            return Ok(PrepareResult::Conflict(register.promise));
-        }
-        if ballot <= register.ballot {
-            return Ok(PrepareResult::Conflict(register.ballot));
-        }
-        // 2. Set the promise to the ballot number.
-        register.promise = ballot;
 
-        let value = VersionedValue {
-            ballot: register.ballot,
-            value: register.value.clone(),
-        };
+        self.registers
+            .update(slot, |register| {
+                if ballot <= register.promise {
+                    return Ok(PrepareResult::Conflict(register.promise));
+                }
+                if ballot <= register.ballot {
+                    return Ok(PrepareResult::Conflict(register.ballot));
+                }
+                // 2. Set the promise to the ballot number.
+                register.promise = ballot;
 
-        let result = PrepareResult::Prepared(value);
-        self.registers.write(slot, register).await;
-        Ok(result)
+                let value = VersionedValue {
+                    ballot: register.ballot,
+                    value: register.value.clone(),
+                };
+                Ok(PrepareResult::Prepared(value))
+            })
+            .await
+            .expect("handle IO error")
     }
 
     async fn accept(&self, slot: Slot, value: VersionedValue) -> Result<AcceptResult, Error> {
-        // 1. Read the register, return a conflict if it already saw a greater ballot number.
-        let mut register = self.registers.read(slot).await;
-        if value.ballot() < register.promise {
-            return Ok(AcceptResult::Conflict {
-                ballot: register.promise,
-            });
-        }
-        if value.ballot() <= register.ballot {
-            return Ok(AcceptResult::Conflict {
-                ballot: register.ballot,
-            });
-        }
-        register.promise = value.ballot();
-        register.ballot = value.ballot();
-        register.value = value.into_value();
-        self.registers.write(slot, register).await;
-        Ok(AcceptResult::Accepted)
+        self.registers
+            .update(slot, |register| {
+                if value.ballot() < register.promise {
+                    return Ok(AcceptResult::Conflict {
+                        ballot: register.promise,
+                    });
+                }
+                if value.ballot() <= register.ballot {
+                    return Ok(AcceptResult::Conflict {
+                        ballot: register.ballot,
+                    });
+                }
+                register.promise = value.ballot();
+                register.ballot = value.ballot();
+                register.value = value.into_value();
+                Ok(AcceptResult::Accepted)
+            })
+            .await
+            .expect("TODO: Handle IO errors")
     }
 }
 
@@ -190,22 +196,25 @@ enum Error {}
 trait Registers {
     fn num_slots(&self) -> usize;
 
-    async fn read(&self, slot: Slot) -> Register;
-
-    async fn write(&self, slot: Slot, register: Register);
+    async fn update<U>(&self, slot: Slot, f: impl FnOnce(&mut Register) -> U) -> io::Result<U>;
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use tokio::sync::Mutex;
+    use tokio::time;
 
     use crate::proposer::Proposer;
+    use crate::sim::{self, buggify};
     use crate::ProposerId;
 
     use super::*;
 
+    #[derive(Debug)]
     struct InMemoryRegisters {
         num_slots: usize,
         registers: Mutex<Vec<Register>>,
@@ -225,13 +234,14 @@ mod tests {
             self.num_slots
         }
 
-        async fn read(&self, slot: Slot) -> Register {
-            let r = self.registers.lock().await[slot.0 as usize].clone();
-            r
-        }
-
-        async fn write(&self, slot: Slot, register: Register) {
-            self.registers.lock().await[slot.0 as usize] = register;
+        async fn update<U>(&self, slot: Slot, f: impl FnOnce(&mut Register) -> U) -> io::Result<U> {
+            buggify::disk_latency(async move {
+                let mut lock = self.registers.lock().await;
+                let reg = lock.get_mut(slot.0 as usize).unwrap();
+                let ret = f(reg);
+                Ok(ret)
+            })
+            .await
         }
     }
 
@@ -251,7 +261,7 @@ mod tests {
         fn new(num_acceptors: usize, num_slots: usize) -> Self {
             let acceptors = (0..num_acceptors)
                 .map(|_| AcceptorImpl::new(InMemoryRegisters::new(num_slots)))
-                .map(|v| Rc::new(v))
+                .map(Rc::new)
                 .collect();
             Self { acceptors }
         }
@@ -261,81 +271,136 @@ mod tests {
         }
     }
 
-    // async fn inc_and_get(pid: ProposerId, acceptors: &Acceptors) -> u64 {
-    //     let ballot = Ballot::new(pid, 0);
-    //     let res = cas(&acceptors.acceptors, SlotId(0), ballot, |old| match old {
-    //         Some(val) => {
-    //             let existing = u64::from_be_bytes(val.try_into().unwrap());
-    //             let new = existing + 1;
-    //             Some(new.to_be_bytes().to_vec())
-    //         }
-    //         None => Some(1u64.to_be_bytes().to_vec()),
-    //     })
-    //     .await;
-    //     res.map(|val| u64::from_be_bytes(val.try_into().unwrap()))
-    //         .unwrap_or(0)
-    // }
+    async fn inc_and_get<A>(proposer: &mut Proposer<A>, stats: &TestStats) -> u64
+    where
+        A: Acceptor + std::fmt::Debug,
+    {
+        let pid = proposer.id();
+        loop {
+            if let Ok(res) = proposer.cas(Slot(0), do_inc).await {
+                stats.record_success();
+                return res
+                    .value()
+                    .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+                    .unwrap_or(0);
+            }
+            stats.record_conflict();
+            time::sleep(Duration::from_millis(100)).await;
+            log::info!("{:?} conflict detected, retrying", pid);
+        }
+    }
 
-    // #[test]
-    // fn multi_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
-    //     init();
-    //     let mut sim = crate::sim::Sim::new();
-    //     let acceptors = Acceptors::new(3, 32);
-
-    //     let acc = acceptors.clone();
-    //     sim.add_machine("proposer-1", async move {
-    //         let p1 = ProposerId(1);
-    //         for i in 0..10 {
-    //             assert_eq!(i, inc_and_get(p1, &acc).await);
-    //         }
-    //         Ok(())
-    //     });
-
-    //     let acc = acceptors.clone();
-    //     sim.add_machine("proposer-2", async move {
-    //         let p1 = ProposerId(2);
-    //         for i in 0..10 {
-    //             assert_eq!(i, inc_and_get(p1, &acc).await);
-    //         }
-    //         Ok(())
-    //     });
-
-    //     sim.block_on(async {
-    //         time::sleep(Duration::from_secs(1000)).await;
-    //         Ok(())
-    //     })?;
-    //     Ok(())
-    // }
-
-    async fn inc_and_get<A>(proposer: &mut Proposer<A>) -> u64
+    async fn get<A>(proposer: &mut Proposer<A>) -> u64
     where
         A: Acceptor,
     {
-        proposer
-            .cas(Slot(0), |old| match old {
-                Some(old_val) => {
-                    let existing = u64::from_be_bytes(old_val.try_into().unwrap());
-                    let new = existing + 1;
-                    Some(new.to_be_bytes().to_vec())
+        loop {
+            if let Ok(res) = proposer.cas(Slot(0), |v| v.map(|s| s.to_owned())).await {
+                return res
+                    .value()
+                    .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
+                    .unwrap_or(0);
+            }
+        }
+    }
+
+    fn do_inc(old: Option<&[u8]>) -> Option<Vec<u8>> {
+        match old {
+            Some(old_val) => {
+                let existing = u64::from_be_bytes(old_val.try_into().unwrap());
+                let new = existing + 1;
+                Some(new.to_be_bytes().to_vec())
+            }
+            None => Some(1u64.to_be_bytes().to_vec()),
+        }
+    }
+
+    struct TestStats {
+        num_conflicts: Cell<usize>,
+        num_success: Cell<usize>,
+    }
+
+    impl TestStats {
+        fn new() -> Self {
+            Self {
+                num_conflicts: Cell::new(0),
+                num_success: Cell::new(0),
+            }
+        }
+
+        fn record_conflict(&self) {
+            self.num_conflicts.set(self.num_conflicts.get() + 1);
+        }
+
+        fn record_success(&self) {
+            self.num_success.set(self.num_success.get() + 1);
+        }
+
+        fn num_conflicts(&self) -> usize {
+            self.num_conflicts.get()
+        }
+
+        fn num_success(&self) -> usize {
+            self.num_success.get()
+        }
+    }
+
+    #[test]
+    fn multi_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
+        for seed in 0..1000 {
+            let test_stats = Rc::new(TestStats::new());
+            println!("seed: {}", seed);
+            let mut sim = crate::sim::Sim::new_with_seed(seed);
+            let acceptors = TestAcceptors::new(3, 1);
+
+            let mut proposer = acceptors.proposer(ProposerId(1));
+            let stats = test_stats.clone();
+            sim.add_machine("proposer-1", async move {
+                for _ in 0..5 {
+                    log::info!("proposer-1: starting inc");
+                    let old = inc_and_get(&mut proposer, &stats).await;
+                    log::info!("proposer-1: inc success, old value: {}", old);
                 }
-                None => Some(1u64.to_be_bytes().to_vec()),
-            })
-            .await
-            .unwrap()
-            .value()
-            .map(|v| u64::from_be_bytes(v.try_into().unwrap()))
-            .unwrap_or(0)
+                Ok(())
+            });
+
+            let mut proposer = acceptors.proposer(ProposerId(2));
+            let stats = test_stats.clone();
+            sim.add_machine("proposer-2", async move {
+                for _ in 0..5 {
+                    log::info!("proposer-2: starting inc");
+                    let old = inc_and_get(&mut proposer, &stats).await;
+                    log::info!("proposer-2: inc success, old value: {}", old);
+                }
+                Ok(())
+            });
+
+            let mut proposer = acceptors.proposer(ProposerId(3));
+            sim.block_on(async move {
+                sim::Handle::current().wait_machines().await;
+                let current_val = get(&mut proposer).await;
+                // Each proposer will increment the value a minimum of 5 times.
+                // The value may be incremented more than 5 times if there are
+                // conflicts, so expected is really an upper bound.
+                let expected = 5 + 5 + test_stats.num_conflicts();
+
+                assert!(current_val <= expected as u64);
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[test]
     fn single_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
         init();
         let sim = crate::sim::Sim::new();
-        sim.block_on(async {
+        let test_stats = Rc::new(TestStats::new());
+        sim.block_on(async move {
             let acceptors = TestAcceptors::new(5, 32);
             let mut proposer = acceptors.proposer(ProposerId(1));
             for i in 0..10 {
-                assert_eq!(i, inc_and_get(&mut proposer).await);
+                assert_eq!(i, inc_and_get(&mut proposer, &test_stats).await);
             }
 
             Ok(())
