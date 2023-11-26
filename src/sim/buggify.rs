@@ -23,6 +23,10 @@ pub(crate) async fn disk_latency<F: Future>(fut: F) -> F::Output {
     }
 }
 
+pub(crate) async fn network_latency2() {
+    tokio::time::sleep(get_delay(Duration::from_millis(500))).await;
+}
+
 pub(crate) async fn network_latency<F: Future>(fut: F) -> F::Output {
     #[cfg(test)]
     {

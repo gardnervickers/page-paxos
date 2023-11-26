@@ -12,7 +12,7 @@ use std::rc::Rc;
 use scoped_tls::scoped_thread_local;
 use tokio::sync::Notify;
 
-use crate::sim::{rng, trial};
+use crate::sim::{net, rng, trial};
 
 scoped_thread_local! {
     static CURRENT: State
@@ -23,6 +23,7 @@ pub(crate) struct State {
     rng: rng::SimRng,
     seed: u64,
     notify_all_machines_complete: Rc<Notify>,
+    network: net::SimNetwork,
 }
 
 impl State {
@@ -33,6 +34,7 @@ impl State {
             notify_all_machines_complete: Rc::new(Notify::new()),
             rng,
             seed,
+            network: net::SimNetwork::new(),
         }
     }
 
@@ -60,6 +62,10 @@ impl State {
 
     pub(crate) fn trial(&self) -> RefMut<'_, trial::Trial> {
         self.trial.borrow_mut()
+    }
+
+    pub(crate) fn network(&self) -> net::SimNetwork {
+        self.network.clone()
     }
 
     pub(crate) fn notify_all_machines_complete(&self) -> Rc<Notify> {

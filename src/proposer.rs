@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::time::Duration;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
+use hyper::rt::Timer;
 
 use crate::acceptor::{AcceptResult, Acceptor, PrepareResult};
 use crate::sim::buggify;
-use crate::{Ballot, ProposerId, Slot, Versioned};
+use crate::{Ballot, NodeId, Slot, Versioned};
 
 static LOG: &str = "proposer";
 
 #[derive(Debug)]
-pub(crate) struct Proposer<A> {
-    id: ProposerId,
+pub(crate) struct Proposer<A, T> {
+    id: NodeId,
     // TODO: Really we could split this into a prepare and accept set, each
     // with their own quorum sizes.
     //
@@ -21,21 +23,24 @@ pub(crate) struct Proposer<A> {
     // and 2 accept nodes.
     acceptors: Vec<A>,
     ballot_cache: HashMap<Slot, Ballot>,
+    timer: T,
 }
 
-impl<A> Proposer<A>
+impl<A, T> Proposer<A, T>
 where
     A: Acceptor,
+    T: Timer,
 {
-    pub(crate) fn new(id: ProposerId, acceptors: Vec<A>) -> Self {
+    pub(crate) fn new(id: NodeId, acceptors: Vec<A>, timer: T) -> Self {
         Self {
             id,
             acceptors,
             ballot_cache: Default::default(),
+            timer,
         }
     }
 
-    pub(crate) fn id(&self) -> ProposerId {
+    pub(crate) fn id(&self) -> NodeId {
         self.id
     }
     /// Perform a consensus operation on the set of acceptors.
@@ -143,6 +148,9 @@ where
                 .unwrap_or(propose_ballot);
             tracing::debug!(target: LOG, ?propose_ballot, ?max_ballot, "prepare.conflict");
             self.cache_ballot(slot, max_ballot);
+
+            // Sleep for a bit and retry.
+            self.timer.sleep(Duration::from_millis(10)).await;
             continue;
         }
     }

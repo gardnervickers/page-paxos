@@ -3,14 +3,13 @@
 //! Each page in the address space is a CASPaxos register.
 #![allow(dead_code)]
 mod acceptor;
+mod env;
+mod net;
 mod proposer;
 mod sim;
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct Ballot(ProposerId, u32);
+struct Ballot(NodeId, u32);
 
 impl std::fmt::Display for Ballot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -36,11 +35,11 @@ impl std::fmt::Debug for Ballot {
 }
 
 impl Ballot {
-    fn new(id: ProposerId, ballot: u32) -> Self {
+    fn new(id: NodeId, ballot: u32) -> Self {
         Self(id, ballot)
     }
 
-    fn increment(&self, id: ProposerId) -> Self {
+    fn increment(&self, id: NodeId) -> Self {
         Self(id, self.1 + 1)
     }
 
@@ -75,13 +74,13 @@ impl PartialOrd for Ballot {
 }
 
 impl Ballot {
-    const UNKNOWN: Ballot = Self(ProposerId::UNKNOWN, u32::MAX);
+    const UNKNOWN: Ballot = Self(NodeId::UNKNOWN, u32::MAX);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct ProposerId(u16);
-impl ProposerId {
-    const UNKNOWN: ProposerId = Self(u16::MAX);
+struct NodeId(u16);
+impl NodeId {
+    const UNKNOWN: NodeId = Self(u16::MAX);
     fn from_u16(id: u16) -> Self {
         Self(id)
     }
@@ -138,8 +137,8 @@ mod test {
 
     #[test]
     fn ballot_order() {
-        let acceptor1 = ProposerId::from_u16(1);
-        let acceptor2 = ProposerId::from_u16(2);
+        let acceptor1 = NodeId::from_u16(1);
+        let acceptor2 = NodeId::from_u16(2);
 
         let ballot1 = Ballot(acceptor1, 1);
         let ballot2 = Ballot(acceptor2, 1);
@@ -149,8 +148,8 @@ mod test {
 
     #[test]
     fn unknown_ballot() {
-        let acceptor1 = ProposerId::from_u16(1);
-        let acceptor2 = ProposerId::from_u16(2);
+        let acceptor1 = NodeId::from_u16(1);
+        let acceptor2 = NodeId::from_u16(2);
         let ballot1 = Ballot(acceptor1, 1);
         let ballot2 = Ballot(acceptor2, 1);
 

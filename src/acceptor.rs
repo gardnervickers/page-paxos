@@ -180,9 +180,11 @@ trait Registers {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::pin::Pin;
     use std::rc::Rc;
     use std::time::Duration;
 
+    use hyper::rt;
     use tokio::sync::Mutex;
     use tokio::time;
     use tracing::level_filters::LevelFilter;
@@ -190,9 +192,38 @@ mod tests {
 
     use crate::proposer::Proposer;
     use crate::sim::{self, buggify};
-    use crate::ProposerId;
+    use crate::NodeId;
 
     use super::*;
+
+    struct TestTimer {}
+
+    struct TestSleep(time::Sleep);
+
+    impl std::future::Future for TestSleep {
+        type Output = ();
+
+        fn poll(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            // Safety: not moving
+            let me = unsafe { Pin::map_unchecked_mut(self, |f| &mut f.0) };
+            me.poll(cx)
+        }
+    }
+
+    impl rt::Sleep for TestSleep {}
+
+    impl rt::Timer for TestTimer {
+        fn sleep(&self, duration: Duration) -> std::pin::Pin<Box<dyn rt::Sleep>> {
+            Box::pin(TestSleep(time::sleep(duration)))
+        }
+
+        fn sleep_until(&self, deadline: std::time::Instant) -> std::pin::Pin<Box<dyn rt::Sleep>> {
+            Box::pin(TestSleep(time::sleep_until(deadline.into())))
+        }
+    }
 
     #[derive(Debug)]
     struct InMemoryRegisters {
@@ -229,7 +260,7 @@ mod tests {
         tracing_subscriber::fmt()
             .with_test_writer()
             .compact()
-            .with_max_level(LevelFilter::TRACE)
+            .with_max_level(LevelFilter::DEBUG)
             .without_time()
             .finish()
             .set_default()
@@ -249,14 +280,15 @@ mod tests {
             Self { acceptors }
         }
 
-        fn proposer(&self, id: ProposerId) -> Proposer<Rc<AcceptorImpl<InMemoryRegisters>>> {
-            Proposer::new(id, self.acceptors.clone())
+        fn proposer(&self, id: NodeId) -> Proposer<Rc<AcceptorImpl<InMemoryRegisters>>, TestTimer> {
+            Proposer::new(id, self.acceptors.clone(), TestTimer {})
         }
     }
 
-    async fn inc_and_get<A>(proposer: &mut Proposer<A>, stats: &TestStats) -> u64
+    async fn inc_and_get<A, T>(proposer: &mut Proposer<A, T>, stats: &TestStats) -> u64
     where
         A: Acceptor + std::fmt::Debug,
+        T: rt::Timer,
     {
         loop {
             if let Ok(res) = proposer.cas(Slot(0), do_inc).await {
@@ -271,9 +303,10 @@ mod tests {
         }
     }
 
-    async fn get<A>(proposer: &mut Proposer<A>) -> u64
+    async fn get<A, T>(proposer: &mut Proposer<A, T>) -> u64
     where
         A: Acceptor,
+        T: rt::Timer,
     {
         loop {
             if let Ok(res) = proposer.cas(Slot(0), |v| v.map(|s| s.to_owned())).await {
@@ -296,6 +329,7 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
     struct TestStats {
         num_conflicts: Cell<usize>,
         num_success: Cell<usize>,
@@ -333,9 +367,9 @@ mod tests {
             let test_stats = Rc::new(TestStats::new());
             let mut sim = crate::sim::Sim::new();
             let acceptors = TestAcceptors::new(5, 1);
-            let mut proposer = acceptors.proposer(ProposerId(1));
+            let mut proposer = acceptors.proposer(NodeId(1));
             let stats = test_stats.clone();
-            sim.add_machine("proposer-1", async move {
+            sim.add_machine("proposer-1", |_| async move {
                 for _ in 0..5 {
                     tracing::info!("inc.start");
                     let old = inc_and_get(&mut proposer, &stats).await;
@@ -344,9 +378,9 @@ mod tests {
                 Ok(())
             });
 
-            let mut proposer = acceptors.proposer(ProposerId(2));
+            let mut proposer = acceptors.proposer(NodeId(2));
             let stats = test_stats.clone();
-            sim.add_machine("proposer-2", async move {
+            sim.add_machine("proposer-2", |_| async move {
                 for _ in 0..5 {
                     tracing::info!("inc.start");
                     let old = inc_and_get(&mut proposer, &stats).await;
@@ -355,9 +389,9 @@ mod tests {
                 Ok(())
             });
 
-            let mut proposer = acceptors.proposer(ProposerId(3));
+            let mut proposer = acceptors.proposer(NodeId(3));
             sim.block_on(async move {
-                sim::Handle::current().wait_machines().await;
+                sim::FaultHandle::current().wait_machines().await;
                 let current_val = get(&mut proposer).await;
                 // Each proposer will increment the value a minimum of 5 times.
                 // The value may be incremented more than 5 times if there are
@@ -374,13 +408,15 @@ mod tests {
 
     #[test]
     fn single_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
-        init();
-        let sim = crate::sim::Sim::new();
+        let _g = init();
+        let sim = crate::sim::Sim::new_with_seed(156151298438505615);
+        //let sim = crate::sim::Sim::new();
         let test_stats = Rc::new(TestStats::new());
         sim.block_on(async move {
             let acceptors = TestAcceptors::new(5, 32);
-            let mut proposer = acceptors.proposer(ProposerId(1));
+            let mut proposer = acceptors.proposer(NodeId(32));
             for i in 0..10 {
+                println!("{test_stats:?}");
                 assert_eq!(i, inc_and_get(&mut proposer, &test_stats).await);
             }
 
@@ -394,7 +430,7 @@ mod tests {
         let sim = crate::sim::Sim::new();
         sim.block_on(async {
             let acceptor = AcceptorImpl::new(InMemoryRegisters::new(32));
-            let p1 = ProposerId(1);
+            let p1 = NodeId(1);
             let slot = Slot(0);
 
             // First prepare should succeed
@@ -406,6 +442,7 @@ mod tests {
             assert!(
                 matches!(result, PrepareResult::Prepared(VersionedVec{ballot,..}) if ballot.is_unknown())
             );
+
 
             // Third prepare at a lower ballot should fail
             let result = acceptor.prepare(slot, Ballot::new(p1, 0)).await;

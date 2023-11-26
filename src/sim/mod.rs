@@ -1,21 +1,25 @@
 //! Simulator for tests.
 //!
 //! TODO: This should probably be split out into a seperate crate.
-pub(crate) mod buggify;
-mod error;
-mod rng;
-mod state;
-mod trial;
-
 use std::future::Future;
 use std::panic;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub(crate) mod buggify;
+mod env;
+mod error;
+mod net;
+mod rng;
+mod state;
+mod trial;
 
 pub use error::SimError;
 use rand::Rng;
 use tracing::Instrument;
+
+use crate::NodeId;
 
 pub struct Sim {
     runtime: tokio::runtime::Runtime,
@@ -45,7 +49,7 @@ impl Sim {
     }
 
     /// Adds a machine to the simulation.
-    pub fn add_machine<S, F>(&mut self, name: S, future: F)
+    pub fn add_machine<S, F>(&mut self, name: S, f: impl FnOnce(Handle) -> F) -> NodeId
     where
         F: Future<Output = Result<(), Box<dyn std::error::Error>>> + 'static,
         S: AsRef<str>,
@@ -53,7 +57,11 @@ impl Sim {
         let name = name.as_ref().to_owned();
 
         let mut trial = self.state.trial();
-        trial.add_machine(name, future);
+        let node_id = trial.next_node_id();
+        let handle = self.handle(node_id);
+        let fut = (f)(handle);
+        trial.add_machine(name, node_id, fut);
+        node_id
     }
 
     #[allow(clippy::await_holding_lock)]
@@ -65,6 +73,7 @@ impl Sim {
         let runtime = self.runtime;
         let state = self.state;
         // Catch panic and convert to error.
+
         let panic = state.enter(|| {
             panic::catch_unwind(panic::AssertUnwindSafe(|| {
                 runtime.block_on(async move {
@@ -83,8 +92,14 @@ impl Sim {
         }
     }
 
-    pub fn handle(&self) -> Handle {
-        Handle {}
+    fn handle(&self, node_id: NodeId) -> Handle {
+        let network = self.state.network().handle(node_id);
+        let rng = self.state.rng().clone();
+        Handle {
+            rng,
+            network,
+            node_id,
+        }
     }
 }
 
@@ -95,21 +110,60 @@ impl Default for Sim {
 }
 
 #[derive(Clone)]
-pub struct Handle;
+pub struct Handle {
+    rng: rng::SimRng,
+    network: net::SimNetworkHandle,
+    node_id: crate::NodeId,
+}
 
-impl Handle {
-    pub fn rng(&self) -> impl rand::RngCore {
-        state::State::current(|s| s.rng().clone())
-    }
+#[derive(Clone)]
+pub struct FaultHandle {}
 
+impl FaultHandle {
     pub async fn wait_machines(&self) {
         state::State::current(|s| s.notify_all_machines_complete().clone())
             .notified()
             .await;
     }
 
-    pub fn current() -> Self {
+    pub(crate) fn current() -> FaultHandle {
         Self {}
+    }
+}
+
+impl crate::env::Env for crate::sim::Handle {
+    type JoinHandle<U> = env::TokioJoinHandle<U>
+    where
+        U: 'static;
+
+    type Network = crate::sim::net::SimNetworkHandle;
+
+    fn spawn_local<F>(&self, future: F) -> Self::JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        Self::JoinHandle::new(tokio::task::spawn_local(future))
+    }
+
+    fn time(&self) -> impl hyper::rt::Timer {
+        env::TokioTimer
+    }
+
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into()
+    }
+
+    fn rand(&self) -> impl rand::Rng {
+        self.rng.clone()
+    }
+
+    fn net(&self) -> Self::Network {
+        self.network.clone()
+    }
+
+    fn node_id(&self) -> crate::NodeId {
+        self.node_id
     }
 }
 
@@ -170,13 +224,10 @@ mod tests {
             .finish()
             .set_default();
         let mut sim = Sim::new_with_seed(0);
-        let handle = sim.handle();
         let real_now = std::time::Instant::now();
-
         let completion_order = Rc::new(RefCell::new(vec![]));
-
         let co = Rc::clone(&completion_order);
-        sim.add_machine("foo", async move {
+        sim.add_machine("foo", move |_| async move {
             tokio::time::sleep(Duration::from_millis(10000)).await;
             tracing::info!("hello from foo");
             co.borrow_mut().push("foo");
@@ -184,7 +235,7 @@ mod tests {
         });
 
         let co = Rc::clone(&completion_order);
-        sim.add_machine("bar", async move {
+        sim.add_machine("bar", move |_| async move {
             tokio::time::sleep(Duration::from_millis(1000)).await;
             tracing::info!("hello from bar");
             co.borrow_mut().push("bar");
@@ -193,6 +244,7 @@ mod tests {
 
         sim.block_on(async {
             let sim_time = tokio::time::Instant::now();
+            let handle = FaultHandle::current();
             handle.wait_machines().await;
             let sim_elapsed = sim_time.elapsed();
 

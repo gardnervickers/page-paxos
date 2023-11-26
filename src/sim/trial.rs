@@ -5,6 +5,7 @@ use std::task::{Context, Poll};
 
 use crate::sim::rng;
 use crate::sim::SimError;
+use crate::NodeId;
 
 use rand::seq::SliceRandom;
 use tracing::Instrument;
@@ -22,6 +23,7 @@ struct Machine {
 
     /// Background tasks spawned by the machine.
     localset: tokio::task::LocalSet,
+    node_id: NodeId,
 }
 
 impl Future for Machine {
@@ -44,6 +46,8 @@ pub(crate) struct Trial {
 
     /// Mapping from a machine name to the machine itself.
     machines: HashMap<String, Machine>,
+
+    next_node_id: u16,
 }
 
 impl Trial {
@@ -53,21 +57,36 @@ impl Trial {
             seed,
             machines: HashMap::new(),
             rng,
+            next_node_id: 1,
         }
     }
 
-    pub(crate) fn add_machine<F>(&mut self, name: String, future: F)
+    pub(crate) fn next_node_id(&mut self) -> NodeId {
+        let node_id = NodeId(self.next_node_id);
+        self.next_node_id += 1;
+        node_id
+    }
+
+    pub(crate) fn add_machine<F>(&mut self, name: String, node_id: NodeId, future: F) -> NodeId
     where
         F: Future<Output = SimResult> + 'static,
     {
+        let future = future.instrument(tracing::info_span!(
+            "machine",
+            machine = name,
+            node_id = node_id.0
+        ));
+
         let machine = Machine {
-            future: Box::pin(future.instrument(tracing::info_span!("machine", machine = name))),
+            node_id,
+            future: Box::pin(future),
             localset: tokio::task::LocalSet::new(),
         };
         if self.machines.contains_key(&name) {
             panic!("machine with name {} already exists", name);
         }
         self.machines.insert(name, machine);
+        node_id
     }
 
     /// Poll all machines in the [`Trial`]. As machines exit, they will
