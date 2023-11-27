@@ -103,7 +103,7 @@ where
     /// On success, returns a tuple of the highest known value for the slot and the
     /// new ballot number. The new ballot number will be higher than any previously seen
     /// ballot numbers and will be owned by this proposer.
-    #[tracing::instrument(skip(self,), ret)]
+    #[tracing::instrument(skip(self))]
     async fn prepare(&mut self, slot: Slot) -> Result<(Versioned<Vec<u8>>, Ballot), Error> {
         loop {
             // TODO: Add backoff/retry and some limit on the number of retries.
@@ -135,6 +135,7 @@ where
                     .unwrap();
                 tracing::debug!(target: LOG, ?propose_ballot, ?value, "prepare.success");
                 self.cache_ballot(slot, propose_ballot);
+
                 return Ok((value, propose_ballot));
             }
 

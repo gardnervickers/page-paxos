@@ -187,6 +187,7 @@ mod tests {
     use hyper::rt;
     use tokio::sync::Mutex;
     use tokio::time;
+    use tracing::info;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -259,7 +260,6 @@ mod tests {
     fn init() -> impl Drop {
         tracing_subscriber::fmt()
             .with_test_writer()
-            .compact()
             .with_max_level(LevelFilter::DEBUG)
             .without_time()
             .finish()
@@ -403,25 +403,6 @@ mod tests {
                 Ok(())
             })?;
         }
-        Ok(())
-    }
-
-    #[test]
-    fn single_node_cas_increment() -> Result<(), Box<dyn std::error::Error>> {
-        let _g = init();
-        let sim = crate::sim::Sim::new_with_seed(156151298438505615);
-        //let sim = crate::sim::Sim::new();
-        let test_stats = Rc::new(TestStats::new());
-        sim.block_on(async move {
-            let acceptors = TestAcceptors::new(5, 32);
-            let mut proposer = acceptors.proposer(NodeId(32));
-            for i in 0..10 {
-                println!("{test_stats:?}");
-                assert_eq!(i, inc_and_get(&mut proposer, &test_stats).await);
-            }
-
-            Ok(())
-        })?;
         Ok(())
     }
 
