@@ -9,30 +9,9 @@ type VersionedVec = Versioned<Vec<u8>>;
 pub(crate) trait Acceptor {
     type Error: std::error::Error + Send + Sync + 'static;
 
-    fn num_slots(&self) -> usize;
-
     async fn prepare(&self, slot: Slot, ballot: Ballot) -> Result<PrepareResult, Self::Error>;
 
     async fn accept(&self, slot: Slot, value: VersionedVec) -> Result<AcceptResult, Self::Error>;
-}
-
-impl<T> Acceptor for Rc<T>
-where
-    T: Acceptor,
-{
-    type Error = T::Error;
-
-    fn num_slots(&self) -> usize {
-        (**self).num_slots()
-    }
-
-    async fn prepare(&self, slot: Slot, ballot: Ballot) -> Result<PrepareResult, Self::Error> {
-        (**self).prepare(slot, ballot).await
-    }
-
-    async fn accept(&self, slot: Slot, value: VersionedVec) -> Result<AcceptResult, Self::Error> {
-        (**self).accept(slot, value).await
-    }
 }
 
 #[derive(Debug)]
@@ -46,15 +25,11 @@ impl<R> AcceptorImpl<R> {
     }
 }
 
-impl<R> Acceptor for AcceptorImpl<R>
+impl<R> Acceptor for Rc<AcceptorImpl<R>>
 where
     R: Registers,
 {
     type Error = Error;
-
-    fn num_slots(&self) -> usize {
-        self.registers.num_slots()
-    }
 
     async fn prepare(&self, slot: Slot, ballot: Ballot) -> Result<PrepareResult, Error> {
         self.registers
@@ -187,7 +162,6 @@ mod tests {
     use hyper::rt;
     use tokio::sync::Mutex;
     use tokio::time;
-    use tracing::info;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -410,7 +384,7 @@ mod tests {
     fn acceptor_prepare() -> Result<(), Box<dyn std::error::Error>> {
         let sim = crate::sim::Sim::new();
         sim.block_on(async {
-            let acceptor = AcceptorImpl::new(InMemoryRegisters::new(32));
+            let acceptor = Rc::new(AcceptorImpl::new(InMemoryRegisters::new(32)));
             let p1 = NodeId(1);
             let slot = Slot(0);
 

@@ -57,6 +57,8 @@ where
     where
         F: FnMut(Option<&[u8]>) -> Option<Vec<u8>>,
     {
+        // Randomize the order of the acceptors to increase the likelihood of
+        // different acceptors being used for the prepare and accept phases.
         buggify::shuffle(&mut self.acceptors);
 
         // 1. Prepare Phase:
