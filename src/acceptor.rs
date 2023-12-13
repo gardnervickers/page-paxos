@@ -162,6 +162,7 @@ mod tests {
     use hyper::rt;
     use tokio::sync::Mutex;
     use tokio::time;
+    use tracing::info;
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -365,7 +366,29 @@ mod tests {
 
             let mut proposer = acceptors.proposer(NodeId(3));
             sim.block_on(async move {
+                // Start out the test with a high flake rate.
+                let faults = crate::sim::FaultHandle::current();
+                faults.with_bugs(|b| {
+                    b.set_acceptor_flake_chance(0.999);
+                });
+                time::sleep(Duration::from_millis(1000)).await;
+                // Reduce the flake rate to 0 and bump up the disk latency
+                // for 10ms to simulate a spike.
+                faults.with_bugs(|b| {
+                    info!("setting request flake to 0 and spiking disk latency");
+                    b.set_acceptor_flake_chance(0.0);
+                    b.set_disk_latency(Duration::from_millis(1000)..Duration::from_millis(5000));
+                });
+                time::sleep(Duration::from_millis(10)).await;
+
+                // Reduce the disk latency back to normal and wait for machines to quiesce.
+                faults.with_bugs(|b| {
+                    info!("disk latency spike complete");
+                    b.set_disk_latency(Duration::from_millis(0)..Duration::from_millis(10));
+                });
+
                 sim::FaultHandle::current().wait_machines().await;
+
                 let current_val = get(&mut proposer).await;
                 // Each proposer will increment the value a minimum of 5 times.
                 // The value may be incremented more than 5 times if there are

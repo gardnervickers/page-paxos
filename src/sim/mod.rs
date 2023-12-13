@@ -5,10 +5,9 @@ use std::future::Future;
 use std::panic;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) mod buggify;
-mod env;
 mod error;
 mod net;
 mod rng;
@@ -129,41 +128,11 @@ impl FaultHandle {
     pub(crate) fn current() -> FaultHandle {
         Self {}
     }
-}
 
-impl crate::env::Env for crate::sim::Handle {
-    type JoinHandle<U> = env::TokioJoinHandle<U>
-    where
-        U: 'static;
-
-    type Network = crate::sim::net::SimNetworkHandle;
-
-    fn spawn_local<F>(&self, future: F) -> Self::JoinHandle<F::Output>
-    where
-        F: Future + 'static,
-        F::Output: 'static,
-    {
-        Self::JoinHandle::new(tokio::task::spawn_local(future))
-    }
-
-    fn time(&self) -> impl hyper::rt::Timer {
-        env::TokioTimer
-    }
-
-    fn now(&self) -> Instant {
-        tokio::time::Instant::now().into()
-    }
-
-    fn rand(&self) -> impl rand::Rng {
-        self.rng.clone()
-    }
-
-    fn net(&self) -> Self::Network {
-        self.network.clone()
-    }
-
-    fn node_id(&self) -> crate::NodeId {
-        self.node_id
+    pub(crate) fn with_bugs(&self, f: impl FnOnce(&buggify::Buggify)) {
+        state::State::current(|s| {
+            f(s.bugs());
+        })
     }
 }
 

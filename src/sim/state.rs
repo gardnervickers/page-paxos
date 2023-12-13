@@ -14,6 +14,8 @@ use tokio::sync::Notify;
 
 use crate::sim::{net, rng, trial};
 
+use super::buggify;
+
 scoped_thread_local! {
     static CURRENT: State
 }
@@ -24,6 +26,7 @@ pub(crate) struct State {
     seed: u64,
     notify_all_machines_complete: Rc<Notify>,
     network: net::SimNetwork,
+    buggify: buggify::Buggify,
 }
 
 impl State {
@@ -35,6 +38,7 @@ impl State {
             rng,
             seed,
             network: net::SimNetwork::new(),
+            buggify: buggify::Buggify::new(),
         }
     }
 
@@ -52,8 +56,22 @@ impl State {
         CURRENT.with(|c| f(c))
     }
 
+    pub(crate) fn try_current<F, U>(f: F) -> Option<U>
+    where
+        F: FnOnce(&Self) -> U,
+    {
+        if !CURRENT.is_set() {
+            return None;
+        }
+        Some(CURRENT.with(|c| f(c)))
+    }
+
     pub(crate) fn rng(&self) -> rng::SimRng {
         self.rng.clone()
+    }
+
+    pub(crate) fn bugs(&self) -> &buggify::Buggify {
+        &self.buggify
     }
 
     pub(crate) fn seed(&self) -> u64 {

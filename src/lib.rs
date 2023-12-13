@@ -3,7 +3,6 @@
 //! Each page in the address space is a CASPaxos register.
 #![allow(dead_code)]
 mod acceptor;
-mod env;
 mod net;
 mod proposer;
 mod sim;

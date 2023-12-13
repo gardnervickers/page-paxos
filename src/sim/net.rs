@@ -81,6 +81,7 @@ impl Network for SimNetworkHandle {
     async fn send(&self, id: NodeId, req: Bytes) -> Result<(), Error> {
         let senders = self.state.senders.borrow();
         let Some(sender) = senders.get(&id) else {
+            // TODO: Maybe this should just return Ok sometimes.
             return Err(crate::net::Error::Io(io::Error::from_raw_os_error(113)));
         };
         sender.send((self.id, req));
